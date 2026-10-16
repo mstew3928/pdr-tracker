@@ -1,104 +1,267 @@
-package com.example.offlinenav
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Offline PDR Tracker</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --accent: #38bdf8;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+    body { background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    header { padding: 12px 16px; background: var(--panel); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; }
+    header h1 { font-size: 1.1rem; font-weight: 700; color: var(--accent); }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 10px 16px; background: var(--panel); text-align: center; }
+    .metric-box { background: var(--bg); padding: 8px 4px; border-radius: 8px; border: 1px solid #334155; }
+    .metric-val { font-size: 1.05rem; font-weight: 700; color: var(--text); }
+    .metric-lbl { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; margin-top: 2px; }
+    .canvas-wrap { flex: 1; position: relative; width: 100%; height: 100%; }
+    canvas { width: 100%; height: 100%; display: block; }
+    .controls { padding: 12px 16px; background: var(--panel); display: flex; gap: 10px; border-top: 1px solid #334155; align-items: center; }
+    button { flex: 1; padding: 12px; border: none; border-radius: 8px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
+    #startBtn { background: var(--accent); color: #0f172a; }
+    #resetBtn { background: #334155; color: var(--text); }
+    .stride-ctrl { display: flex; flex-direction: column; font-size: 0.75rem; color: var(--muted); flex: 1.2; }
+  </style>
+</head>
+<body>
 
-import android.content.Context
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
-import kotlin.math.cos
-import kotlin.math.sin
+  <header>
+    <h1>PDR Offline Navigation</h1>
+    <span id="statusText" style="font-size: 0.8rem; color: #94a3b8;">Idle</span>
+  </header>
 
-data class Position3D(
-    val xMeters: Float,
-    val yMeters: Float,
-    val zAltitudeMeters: Float,
-    val headingDegrees: Float,
-    val stepCount: Int
-)
+  <div class="metrics">
+    <div class="metric-box">
+      <div class="metric-val" id="stepsVal">0</div>
+      <div class="metric-lbl">Steps</div>
+    </div>
+    <div class="metric-box">
+      <div class="metric-val" id="distVal">0.0 m</div>
+      <div class="metric-lbl">Distance</div>
+    </div>
+    <div class="metric-box">
+      <div class="metric-val" id="hdgVal">0°</div>
+      <div class="metric-lbl">Heading</div>
+    </div>
+    <div class="metric-box">
+      <div class="metric-val" id="posVal">0, 0</div>
+      <div class="metric-lbl">X, Y (m)</div>
+    </div>
+  </div>
 
-class PdrTracker(
-    context: Context,
-    private val strideLengthMeters: Float = 0.72f, // Average human stride; can be made dynamic
-    private val onPositionUpdated: (Position3D) -> Unit
-) : SensorEventListener {
+  <div class="canvas-wrap">
+    <canvas id="mapCanvas"></canvas>
+  </div>
 
-    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    private val stepSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
-    private val rotationSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-    private val pressureSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
+  <div class="controls">
+    <button id="startBtn">Start Tracking</button>
+    <button id="resetBtn">Zero / Reset</button>
+    <div class="stride-ctrl">
+      <label for="strideSlider">Stride K: <span id="kVal">0.45</span></label>
+      <input type="range" id="strideSlider" min="0.25" max="0.75" step="0.05" value="0.45" />
+    </div>
+  </div>
 
-    private var posX = 0f
-    private var posY = 0f
-    private var posZ = 0f
-    private var baselinePressure: Float? = null
-    private var currentHeadingRad = 0f
-    private var totalSteps = 0
+  <script>
+    // --- State Variables ---
+    let tracking = false;
+    let steps = 0;
+    let totalDistance = 0;
+    let headingDeg = 0; // Degrees (0 = North / initial forward)
+    let posX = 0;       // Meters East/Right
+    let posY = 0;       // Meters North/Forward
+    let path = [{ x: 0, y: 0 }];
 
-    private val rotationMatrix = FloatArray(9)
-    private val orientationAngles = FloatArray(3)
+    // Step detection & Weinberg stride estimation state
+    let filteredMag = 9.81;
+    let stepMax = 0;
+    let stepMin = 99;
+    let lastStepTime = 0;
+    const STEP_THRESHOLD = 11.2; // m/s^2 peak threshold (gravity ~9.81)
+    const MIN_STEP_DELAY_MS = 320; // Max ~3 steps/sec
 
-    fun start() {
-        stepSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
-        }
-        rotationSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        pressureSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        }
+    // UI Elements
+    const startBtn = document.getElementById('startBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const statusText = document.getElementById('statusText');
+    const stepsVal = document.getElementById('stepsVal');
+    const distVal = document.getElementById('distVal');
+    const hdgVal = document.getElementById('hdgVal');
+    const posVal = document.getElementById('posVal');
+    const strideSlider = document.getElementById('strideSlider');
+    const kVal = document.getElementById('kVal');
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+
+    strideSlider.addEventListener('input', (e) => {
+      kVal.textContent = e.target.value;
+    });
+
+    function resizeCanvas() {
+      canvas.width = canvas.clientWidth * window.devicePixelRatio;
+      canvas.height = canvas.clientHeight * window.devicePixelRatio;
+      drawMap();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- Sensor Handlers ---
+    function handleOrientation(event) {
+      if (!tracking) return;
+      if (event.webkitCompassHeading !== undefined) {
+        headingDeg = event.webkitCompassHeading;
+      } else if (event.alpha !== null) {
+        headingDeg = (360 - event.alpha) % 360;
+      }
+      hdgVal.textContent = Math.round(headingDeg) + '°';
+      drawMap();
     }
 
-    fun stop() {
-        sensorManager.unregisterListener(this)
+    function handleMotion(event) {
+      if (!tracking) return;
+      const acc = event.accelerationIncludingGravity;
+      if (!acc || acc.x === null) return;
+
+      const rawMag = Math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+      const alpha = 0.25;
+      filteredMag = alpha * rawMag + (1 - alpha) * filteredMag;
+
+      if (filteredMag > stepMax) stepMax = filteredMag;
+      if (filteredMag < stepMin) stepMin = filteredMag;
+
+      const now = performance.now();
+
+      if (filteredMag > STEP_THRESHOLD && (now - lastStepTime) > MIN_STEP_DELAY_MS) {
+        lastStepTime = now;
+        steps++;
+
+        const k = parseFloat(strideSlider.value);
+        const bounce = Math.max(0.5, stepMax - stepMin);
+        const strideLength = k * Math.pow(bounce, 0.25);
+
+        stepMax = 9.81;
+        stepMin = 9.81;
+
+        const rad = (headingDeg * Math.PI) / 180;
+        posX += strideLength * Math.sin(rad);
+        posY += strideLength * Math.cos(rad);
+        totalDistance += strideLength;
+
+        path.push({ x: posX, y: posY });
+        updateUI();
+        drawMap();
+      }
     }
 
-    fun resetOrigin() {
-        posX = 0f
-        posY = 0f
-        posZ = 0f
-        totalSteps = 0
-        baselinePressure = null
-        emitUpdate()
+    function updateUI() {
+      stepsVal.textContent = steps;
+      distVal.textContent = totalDistance.toFixed(1) + ' m';
+      posVal.textContent = `${posX.toFixed(1)}, ${posY.toFixed(1)}`;
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        when (event.sensor.type) {
-            // 1. Fused 3D Orientation (Gyro + Accel + Magnetometer)
-            Sensor.TYPE_ROTATION_VECTOR -> {
-                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-                SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                // orientationAngles[0] is azimuth (yaw) in radians (-PI to +PI)
-                currentHeadingRad = orientationAngles[0]
-                emitUpdate()
+    function drawMap() {
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const scale = 18 * window.devicePixelRatio;
+      const centerX = w / 2 - posX * scale;
+      const centerY = h / 2 + posY * scale;
+
+      ctx.strokeStyle = '#1e293b';
+      ctx.lineWidth = 1;
+      const gridStep = scale;
+      for (let x = centerX % gridStep; x < w; x += gridStep) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      }
+      for (let y = centerY % gridStep; y < h; y += gridStep) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+
+      ctx.fillStyle = '#64748b';
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, 5 * window.devicePixelRatio, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (path.length > 1) {
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 3 * window.devicePixelRatio;
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        path.forEach((pt, idx) => {
+          const px = centerX + pt.x * scale;
+          const py = centerY - pt.y * scale;
+          if (idx === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+      }
+
+      const userScreenX = w / 2;
+      const userScreenY = h / 2;
+      const rad = (headingDeg * Math.PI) / 180;
+
+      ctx.save();
+      ctx.translate(userScreenX, userScreenY);
+      ctx.rotate(rad);
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-14 * window.devicePixelRatio, -36 * window.devicePixelRatio);
+      ctx.lineTo(14 * window.devicePixelRatio, -36 * window.devicePixelRatio);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.beginPath();
+      ctx.arc(userScreenX, userScreenY, 7 * window.devicePixelRatio, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    startBtn.addEventListener('click', async () => {
+      if (!tracking) {
+        if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+          try {
+            const resp = await DeviceMotionEvent.requestPermission();
+            if (resp !== 'granted') {
+              statusText.textContent = 'Permission denied';
+              return;
             }
-
-            // 2. Hardware Step Trigger -> Advance (X, Y) along current heading
-            Sensor.TYPE_STEP_DETECTOR -> {
-                if (event.values[0] == 1.0f) {
-                    totalSteps++
-                    posX += strideLengthMeters * sin(currentHeadingRad)
-                    posY += strideLengthMeters * cos(currentHeadingRad)
-                    emitUpdate()
-                }
-            }
-
-            // 3. Barometer -> Relative Z-Axis Elevation (Underground / Multi-floor)
-            Sensor.TYPE_PRESSURE -> {
-                val currentPressure = event.values[0]
-                if (baselinePressure == null) {
-                    baselinePressure = currentPressure
-                }
-                posZ = SensorManager.getAltitude(baselinePressure!!, currentPressure)
-                emitUpdate()
-            }
+          } catch (err) {
+            console.error(err);
+          }
         }
-    }
+        window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+        window.addEventListener('deviceorientation', handleOrientation, true);
+        window.addEventListener('devicemotion', handleMotion, true);
+        tracking = true;
+        startBtn.textContent = 'Pause';
+        startBtn.style.background = '#f59e0b';
+        statusText.textContent = 'Tracking Active';
+      } else {
+        tracking = false;
+        startBtn.textContent = 'Resume';
+        startBtn.style.background = '#38bdf8';
+        statusText.textContent = 'Paused';
+      }
+    });
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-
-    private fun emitUpdate() {
-        val headingDeg = ((Math.toDegrees(currentHeadingRad.toDouble()).toFloat() + 360f) % 360f)
-        onPositionUpdated(Position3D(posX, posY, posZ, headingDeg, totalSteps))
-    }
-}
+    resetBtn.addEventListener('click', () => {
+      steps = 0;
+      totalDistance = 0;
+      posX = 0;
+      posY = 0;
+      path = [{ x: 0, y: 0 }];
+      updateUI();
+      drawMap();
+    });
+  </script>
+</body>
+</html>
